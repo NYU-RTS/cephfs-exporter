@@ -30,6 +30,11 @@ var (
 		"Total number of files and subdirectories",
 		[]string{"path"}, nil,
 	)
+	rfilesDesc = prometheus.NewDesc(
+		"cephfs_rfiles",
+		"Total number of files",
+		[]string{"path"}, nil,
+	)
 )
 
 type Collector struct {
@@ -80,6 +85,12 @@ func (c Collector) observePath(path string, ch chan<- prometheus.Metric, optiona
 		return fmt.Errorf("Getting rentries: %w", err)
 	}
 
+	// Read files
+	rfiles, err := getNumXattr(c.filesystem, path, "ceph.dir.rfiles")
+	if err != nil {
+		return fmt.Errorf("Getting rfiles: %w", err)
+	}
+
 	// Emit metrics
 	ch <- prometheus.MustNewConstMetric(
 		rbytesDesc,
@@ -91,6 +102,12 @@ func (c Collector) observePath(path string, ch chan<- prometheus.Metric, optiona
 		rentriesDesc,
 		prometheus.GaugeValue,
 		float64(rentries),
+		path,
+	)
+	ch <- prometheus.MustNewConstMetric(
+		rfilesDesc,
+		prometheus.GaugeValue,
+		float64(rfiles),
 		path,
 	)
 
