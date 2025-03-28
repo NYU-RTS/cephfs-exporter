@@ -3,7 +3,7 @@ RUN apt-get update && apt-get install -yy librados-dev libcephfs-dev && rm -rf /
 ARG TARGETARCH
 WORKDIR /usr/src/app
 COPY *.go go.mod go.sum ./
-RUN CGO_ENABLED=1 GOOS=linux GOARCH=$TARGETARCH go build -tags netgo -ldflags -w -o bin/cephfs-exporter ./main.go
+RUN CGO_ENABLED=1 GOOS=linux GOARCH=$TARGETARCH go build -tags netgo -ldflags -w -o bin/cephfs-exporter ./ceph-exporter.go
 
 FROM debian:bookworm
 RUN apt-get update && apt-get install -yy librados2 libcephfs2 && rm -rf /var/lib/apt/lists/*
