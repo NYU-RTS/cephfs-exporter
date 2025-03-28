@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -18,6 +20,31 @@ const (
 	defaultCephConfigPath = "/etc/ceph/ceph.conf"
 	defaultCephUser       = "admin"
 )
+
+type ReportConfig struct {
+	Report        bool                     `json:"report"`
+	SkipIfSmaller uint64                   `json:"skip_if_smaller,omitempty"`
+	Entries       map[string]*ReportConfig `json:"entries,omitempty"`
+}
+
+func parseReportConfig(config string) (*ReportConfig, error) {
+	buffer := bytes.NewBufferString(config)
+	decoder := json.NewDecoder(buffer)
+	decoder.DisallowUnknownFields()
+	var reportConfig ReportConfig
+	if err := decoder.Decode(&reportConfig); err != nil {
+		return nil, err
+	}
+	return &reportConfig, nil
+}
+
+func (conf *ReportConfig) GetEntry(entry string) *ReportConfig {
+	entryConf, found := conf.Entries[entry]
+	if found {
+		return entryConf
+	}
+	return conf.Entries["*"] // Might be nil
+}
 
 var (
 	rbytesDesc = prometheus.NewDesc(
@@ -39,9 +66,8 @@ var (
 
 type Collector struct {
 	prometheus.Collector
-	filesystem       *cephfs.MountInfo
-	recurseMinSize   uint64
-	recurseMaxLevels int
+	filesystem   *cephfs.MountInfo
+	reportConfig *ReportConfig
 }
 
 func (c Collector) Describe(ch chan<- *prometheus.Desc) {
@@ -49,7 +75,7 @@ func (c Collector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c Collector) Collect(ch chan<- prometheus.Metric) {
-	err := c.observePath("/", ch, false, 0)
+	err := c.observePath("/", ch, c.reportConfig)
 	if err != nil {
 		log.Print(err)
 	}
@@ -67,52 +93,54 @@ func getNumXattr(filesystem *cephfs.MountInfo, path string, attr string) (uint64
 	return num, nil
 }
 
-func (c Collector) observePath(path string, ch chan<- prometheus.Metric, optional bool, level int) error {
+func (c Collector) observePath(path string, ch chan<- prometheus.Metric, reportConfig *ReportConfig) error {
 	// Read rbytes
 	rbytes, err := getNumXattr(c.filesystem, path, "ceph.dir.rbytes")
 	if err != nil {
 		return fmt.Errorf("Getting rbytes: %w", err)
 	}
 
-	// If we are recursing and this directory is small, stop
-	if optional && rbytes < c.recurseMinSize || level > c.recurseMaxLevels {
+	// If this directory is too small, stop
+	if rbytes < reportConfig.SkipIfSmaller {
 		return nil
 	}
 
-	// Read entries
-	rentries, err := getNumXattr(c.filesystem, path, "ceph.dir.rentries")
-	if err != nil {
-		return fmt.Errorf("Getting rentries: %w", err)
-	}
+	if reportConfig.Report {
+		// Read entries
+		rentries, err := getNumXattr(c.filesystem, path, "ceph.dir.rentries")
+		if err != nil {
+			return fmt.Errorf("Getting rentries: %w", err)
+		}
 
-	// Read files
-	rfiles, err := getNumXattr(c.filesystem, path, "ceph.dir.rfiles")
-	if err != nil {
-		return fmt.Errorf("Getting rfiles: %w", err)
-	}
+		// Read files
+		rfiles, err := getNumXattr(c.filesystem, path, "ceph.dir.rfiles")
+		if err != nil {
+			return fmt.Errorf("Getting rfiles: %w", err)
+		}
 
-	// Emit metrics
-	ch <- prometheus.MustNewConstMetric(
-		rbytesDesc,
-		prometheus.GaugeValue,
-		float64(rbytes),
-		path,
-	)
-	ch <- prometheus.MustNewConstMetric(
-		rentriesDesc,
-		prometheus.GaugeValue,
-		float64(rentries),
-		path,
-	)
-	ch <- prometheus.MustNewConstMetric(
-		rfilesDesc,
-		prometheus.GaugeValue,
-		float64(rfiles),
-		path,
-	)
+		// Emit metrics
+		ch <- prometheus.MustNewConstMetric(
+			rbytesDesc,
+			prometheus.GaugeValue,
+			float64(rbytes),
+			path,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			rentriesDesc,
+			prometheus.GaugeValue,
+			float64(rentries),
+			path,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			rfilesDesc,
+			prometheus.GaugeValue,
+			float64(rfiles),
+			path,
+		)
+	}
 
 	// Recurse
-	if rbytes >= c.recurseMinSize {
+	if len(reportConfig.Entries) > 0 {
 		dir, err := c.filesystem.OpenDir(path)
 		if err != nil {
 			return fmt.Errorf("Opening directory: %w", err)
@@ -129,11 +157,14 @@ func (c Collector) observePath(path string, ch chan<- prometheus.Metric, optiona
 				continue
 			}
 			if entryDir.DType() == cephfs.DTypeDir {
+				subReportConfig := reportConfig.GetEntry(entryDir.Name())
+				if subReportConfig == nil {
+					continue
+				}
 				err := c.observePath(
 					filepath.Join(path, entryDir.Name()),
 					ch,
-					true, // optional, only observe if big enough
-					level+1,
+					subReportConfig,
 				)
 				if err != nil {
 					return err
@@ -147,12 +178,11 @@ func (c Collector) observePath(path string, ch chan<- prometheus.Metric, optiona
 
 func main() {
 	var (
-		metricsAddr      = envflag.String("TELEMETRY_ADDR", ":9128", "Host:Port for metrics endpoint")
-		metricsPath      = envflag.String("TELEMETRY_PATH", "/metrics", "URL path for metrics endpoint")
-		cephConfig       = envflag.String("CEPH_CONFIG", defaultCephConfigPath, "Path to Ceph config file")
-		cephUser         = envflag.String("CEPH_USER", defaultCephUser, "Ceph user to connect to cluster")
-		recurseMinSize   = envflag.Uint64("RECURSE_MIN_SIZE", 100_000_000_000, "Minimum size of directory to recurse")
-		recurseMaxLevels = envflag.Int("RECURSE_MAX_LEVELS", 5, "Maximum levels to recurse")
+		metricsAddr  = envflag.String("TELEMETRY_ADDR", ":9128", "Host:Port for metrics endpoint")
+		metricsPath  = envflag.String("TELEMETRY_PATH", "/metrics", "URL path for metrics endpoint")
+		cephConfig   = envflag.String("CEPH_CONFIG", defaultCephConfigPath, "Path to Ceph config file")
+		cephUser     = envflag.String("CEPH_USER", defaultCephUser, "Ceph user to connect to cluster")
+		reportConfig = envflag.String("REPORT_CONFIG", "{\"report\": true}", "Report configuration")
 	)
 
 	envflag.Parse()
@@ -196,10 +226,14 @@ func main() {
 	defer filesystem.Unmount()
 	log.Print("Successfully mounted Ceph filesystem!")
 
+	parsedReportConfig, err := parseReportConfig(*reportConfig)
+    if err != nil {
+        log.Fatalf("Invalid report config: %v", err)
+    }
+
 	prometheus.MustRegister(Collector{
-		filesystem:       filesystem,
-		recurseMinSize:   *recurseMinSize,
-		recurseMaxLevels: *recurseMaxLevels,
+		filesystem:   filesystem,
+		reportConfig: parsedReportConfig,
 	})
 	http.Handle(*metricsPath, promhttp.Handler())
 
