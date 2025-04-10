@@ -71,7 +71,9 @@ type Collector struct {
 }
 
 func (c Collector) Describe(ch chan<- *prometheus.Desc) {
-	prometheus.DescribeByCollect(c, ch)
+	ch <- rbytesDesc
+	ch <- rentriesDesc
+	ch <- rfilesDesc
 }
 
 func (c Collector) Collect(ch chan<- prometheus.Metric) {
