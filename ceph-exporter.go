@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/ceph/go-ceph/cephfs"
 	rados "github.com/ceph/go-ceph/rados"
@@ -23,8 +24,14 @@ const (
 
 type ReportConfig struct {
 	Report        bool                     `json:"report"`
+	Snapshots     []ReportSnapshotConfig   `json:"snapshots,omitempty"`
 	SkipIfSmaller uint64                   `json:"skip_if_smaller,omitempty"`
 	Entries       map[string]*ReportConfig `json:"entries,omitempty"`
+}
+
+type ReportSnapshotConfig struct {
+	Type   string `json:"type"`
+	Prefix string `json:"prefix,omitempty"`
 }
 
 func parseReportConfig(config string) (*ReportConfig, error) {
@@ -62,6 +69,11 @@ var (
 		"Total number of files",
 		[]string{"path"}, nil,
 	)
+	snapsDesc = prometheus.NewDesc(
+		"cephfs_snaps",
+		"Number of snapshots",
+		[]string{"path", "type"}, nil,
+	)
 )
 
 type Collector struct {
@@ -74,6 +86,7 @@ func (c Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- rbytesDesc
 	ch <- rentriesDesc
 	ch <- rfilesDesc
+	ch <- snapsDesc
 }
 
 func (c Collector) Collect(ch chan<- prometheus.Metric) {
@@ -139,6 +152,44 @@ func (c Collector) observePath(path string, ch chan<- prometheus.Metric, reportC
 			float64(rfiles),
 			path,
 		)
+	}
+
+	if len(reportConfig.Snapshots) > 0 {
+		// Gather list of all snapshots
+		var snapshots []string
+		dir, err := c.filesystem.OpenDir(path + "/.snap")
+		if err != nil {
+			return fmt.Errorf("Opening snap directory: %w", err)
+		}
+		for {
+			entry, err := dir.ReadDir()
+			if err != nil {
+				return fmt.Errorf("Reading snap directory: %w", err)
+			}
+			if entry == nil {
+				break
+			}
+			if entry.Name() == "." || entry.Name() == ".." {
+				continue
+			}
+			snapshots = append(snapshots, entry.Name())
+		}
+
+		for _, metricConfig := range reportConfig.Snapshots {
+			count := 0
+			for _, snapshot := range snapshots {
+				if strings.HasPrefix(snapshot, metricConfig.Prefix) {
+					count += 1
+				}
+			}
+			ch <- prometheus.MustNewConstMetric(
+				snapsDesc,
+				prometheus.GaugeValue,
+				float64(count),
+				path,
+				metricConfig.Type,
+			)
+		}
 	}
 
 	// Recurse
@@ -229,9 +280,9 @@ func main() {
 	log.Print("Successfully mounted Ceph filesystem!")
 
 	parsedReportConfig, err := parseReportConfig(*reportConfig)
-    if err != nil {
-        log.Fatalf("Invalid report config: %v", err)
-    }
+	if err != nil {
+		log.Fatalf("Invalid report config: %v", err)
+	}
 
 	prometheus.MustRegister(Collector{
 		filesystem:   filesystem,
