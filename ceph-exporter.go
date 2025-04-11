@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"time"
 
 	"github.com/ceph/go-ceph/cephfs"
 	rados "github.com/ceph/go-ceph/rados"
@@ -72,6 +73,16 @@ var (
 	snapsDesc = prometheus.NewDesc(
 		"cephfs_snaps",
 		"Number of snapshots",
+		[]string{"path", "type"}, nil,
+	)
+	snapsOldestDesc = prometheus.NewDesc(
+		"cephfs_snap_oldest",
+		"Timestamp of oldest snapshot",
+		[]string{"path", "type"}, nil,
+	)
+	snapsNewestDesc = prometheus.NewDesc(
+		"cephfs_snap_newest",
+		"Timestamp of newest snapshot",
 		[]string{"path", "type"}, nil,
 	)
 )
@@ -177,13 +188,32 @@ func (c Collector) observePath(path string, ch chan<- prometheus.Metric, reportC
 
 		for _, metricConfig := range reportConfig.Snapshots {
 			count := 0
+			var oldest, newest *time.Time
 			for _, snapshot := range snapshots {
-				match := true
+				var match []string
 				if metricConfig.Regexp != nil {
-					match = metricConfig.Regexp.MatchString(snapshot)
+					match = metricConfig.Regexp.FindStringSubmatch(snapshot)
 				}
-				if match {
+				if metricConfig.Regexp == nil || match != nil {
+					// It matches, count it
 					count += 1
+
+					// If there is a 'date' sub-expression, measure that
+					if match != nil {
+						dateSubexp := metricConfig.Regexp.SubexpIndex("date")
+						if dateSubexp != -1 {
+							date, err := time.Parse("2006-01-02-15_04_05", match[dateSubexp])
+							if err != nil {
+								continue
+							}
+							if oldest == nil || date.Before(*oldest) {
+								oldest = &date
+							}
+							if newest == nil || newest.Before(date) {
+								newest = &date
+							}
+						}
+					}
 				}
 			}
 			ch <- prometheus.MustNewConstMetric(
@@ -193,6 +223,22 @@ func (c Collector) observePath(path string, ch chan<- prometheus.Metric, reportC
 				path,
 				metricConfig.Type,
 			)
+			if oldest != nil {
+				ch <- prometheus.MustNewConstMetric(
+					snapsOldestDesc,
+					prometheus.GaugeValue,
+					float64(oldest.Unix()),
+					path,
+					metricConfig.Type,
+				)
+				ch <- prometheus.MustNewConstMetric(
+					snapsNewestDesc,
+					prometheus.GaugeValue,
+					float64(newest.Unix()),
+					path,
+					metricConfig.Type,
+				)
+			}
 		}
 	}
 
