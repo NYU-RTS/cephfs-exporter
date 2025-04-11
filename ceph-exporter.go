@@ -7,8 +7,8 @@ import (
 	"log"
 	"net/http"
 	"path/filepath"
+	"regexp"
 	"strconv"
-	"strings"
 
 	"github.com/ceph/go-ceph/cephfs"
 	rados "github.com/ceph/go-ceph/rados"
@@ -30,8 +30,8 @@ type ReportConfig struct {
 }
 
 type ReportSnapshotConfig struct {
-	Type   string `json:"type"`
-	Prefix string `json:"prefix,omitempty"`
+	Type   string         `json:"type"`
+	Regexp *regexp.Regexp `json:"regexp,omitempty"`
 }
 
 func parseReportConfig(config string) (*ReportConfig, error) {
@@ -178,7 +178,11 @@ func (c Collector) observePath(path string, ch chan<- prometheus.Metric, reportC
 		for _, metricConfig := range reportConfig.Snapshots {
 			count := 0
 			for _, snapshot := range snapshots {
-				if strings.HasPrefix(snapshot, metricConfig.Prefix) {
+				match := true
+				if metricConfig.Regexp != nil {
+					match = metricConfig.Regexp.MatchString(snapshot)
+				}
+				if match {
 					count += 1
 				}
 			}
