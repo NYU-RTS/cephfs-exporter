@@ -1,4 +1,4 @@
-FROM golang:1.26-trixie AS build
+FROM golang:1.27-trixie AS build
 RUN apt-get update && apt-get install -yy librados-dev libcephfs-dev && rm -rf /var/lib/apt/lists/*
 ARG TARGETARCH
 WORKDIR /usr/src/app
